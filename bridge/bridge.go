@@ -11,8 +11,16 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	dockerapi "github.com/fsouza/go-dockerclient"
+	"github.com/rancher/go-rancher-metadata/metadata"
+)
+
+const (
+    metadataURL = "http://rancher-metadata/2015-12-19" 
+    multiplierForTwoMin = 6 // 3 sec
+    emptyIPAddress      = ""
 )
 
 var serviceIDPattern = regexp.MustCompile(`^(.+?):([a-zA-Z0-9][a-zA-Z0-9_.-]+):[0-9]+(?::udp)?$`)
@@ -24,6 +32,7 @@ type Bridge struct {
 	services       map[string][]*Service
 	deadContainers map[string]*DeadContainer
 	config         Config
+	mdClient 	   metadata.Client
 }
 
 func New(docker *dockerapi.Client, adapterUri string, config Config) (*Bridge, error) {
@@ -36,6 +45,16 @@ func New(docker *dockerapi.Client, adapterUri string, config Config) (*Bridge, e
 		return nil, errors.New("unrecognized adapter: " + adapterUri)
 	}
 
+	var mdClient metadata.Client
+
+    if config.RancherInternalIP == true {
+        mdClient, err = metadata.NewClientAndWait(metadataURL)
+        if err != nil {
+            log.Println("loading mdclient failed: %v", err)
+            return nil, errors.New("loading mdclient failed: " + metadataURL)
+        }
+    }
+
 	log.Println("Using", uri.Scheme, "adapter:", uri)
 	return &Bridge{
 		docker:         docker,
@@ -43,6 +62,7 @@ func New(docker *dockerapi.Client, adapterUri string, config Config) (*Bridge, e
 		registry:       factory.New(uri),
 		services:       make(map[string][]*Service),
 		deadContainers: make(map[string]*DeadContainer),
+		mdClient:		mdClient,
 	}, nil
 }
 
@@ -180,6 +200,63 @@ func (b *Bridge) Sync(quiet bool) {
 	}
 }
 
+// GetExternalPort returns the External Port for the given container id, return an empty string
+// if not found
+func (b *Bridge) GetExternalPorts(cid, rancherid string) []string {
+	log.Println("GetExternalPorts " + cid + " , " + rancherid)
+	var emptyPort = []string{}
+	
+	for i := 0; i < multiplierForTwoMin; i++ {
+		containers, err := b.mdClient.GetContainers()
+		if err != nil {
+			log.Println("rancher-cni-ipam: Error getting metadata containers: ", err)
+			return emptyPort
+		}
+
+		for _, container := range containers {
+			if container.ExternalId == cid && len(container.Ports) != 0 {
+				log.Println("got ports: ", container.Ports)
+				return container.Ports
+			}
+			if rancherid != "" && container.UUID == rancherid && len(container.Ports) != 0 {
+				log.Println("got ports from rancherid: ", container.Ports)
+				return container.Ports
+			}
+		}
+		log.Println("Waiting to find Port for container:", cid, rancherid)
+		time.Sleep(500 * time.Millisecond)
+	}
+	log.Println("port not found for cid: ", cid)
+	return emptyPort
+}
+
+// GetIP returns the IP address for the given container id, return an empty string
+// if not found
+func (b *Bridge) GetIP(cid, rancherid string) string {
+	for i := 0; i < multiplierForTwoMin; i++ {
+		containers, err := b.mdClient.GetContainers()
+		if err != nil {
+			log.Println("rancher-cni-ipam: Error getting metadata containers: ", err)
+			return emptyIPAddress
+		}
+
+		for _, container := range containers {
+			if container.ExternalId == cid && container.PrimaryIp != "" {
+				log.Println("rancher-cni-ipam: got ip: ", container.PrimaryIp)
+				return container.PrimaryIp
+			}
+			if rancherid != "" && container.UUID == rancherid && container.PrimaryIp != "" {
+				log.Println("rancher-cni-ipam: got ip from rancherid: ", container.PrimaryIp)
+				return container.PrimaryIp
+			}
+		}
+		log.Println("Waiting to find IP for container: ", cid, rancherid)
+		time.Sleep(500 * time.Millisecond)
+	}
+	log.Println("ip not found for cid: ", cid)
+	return emptyIPAddress
+}
+
 func (b *Bridge) add(containerId string, quiet bool) {
 	if d := b.deadContainers[containerId]; d != nil {
 		b.services[containerId] = d.Services
@@ -200,16 +277,64 @@ func (b *Bridge) add(containerId string, quiet bool) {
 
 	ports := make(map[string]ServicePort)
 
+	var internalIPAddress string
+
+    //extract rancher IP mappings
+    log.Println("len container.Config.ExposedPorts = ", len(container.Config.ExposedPorts))
+    log.Println("len container.NetworkSettings.Ports = ", len(container.NetworkSettings.Ports))
+    if b.config.RancherInternalIP == true {
+
+        log.Println("Loading rancher internal IP for  " + container.ID)
+
+        internalIP := b.GetIP(container.ID, "")
+        internalIPAddress = internalIP
+        log.Println("Got internal IP address: ", internalIP)
+
+        //for _, port := range ports {
+        //	port.ExposedIP = internalIP
+        	//port.HostIP = internalIP // a hostIP that doesn't resolve won't be a valid service
+        //}
+        log.Println("Ports after addition of internal IP: ", ports)
+    }
+
 	// Extract configured host port mappings, relevant when using --net=host
 	for port, _ := range container.Config.ExposedPorts {
 		published := []dockerapi.PortBinding{ {"0.0.0.0", port.Port()}, }
-		ports[string(port)] = servicePort(container, port, published)
+		ports[string(port)] = servicePort(container, port, published, internalIPAddress)
 	}
 
 	// Extract runtime port mappings, relevant when using --net=bridge
 	for port, published := range container.NetworkSettings.Ports {
-		ports[string(port)] = servicePort(container, port, published)
+		ports[string(port)] = servicePort(container, port, published, internalIPAddress)
 	}
+
+	//extract rancher port mappings
+	log.Println("len container.Config.ExposedPorts = ", len(container.Config.ExposedPorts))
+	log.Println("len container.NetworkSettings.Ports = ", len(container.NetworkSettings.Ports))
+	if b.config.RancherExternalPorts == true {
+		//log.Println("Removing internal ports, ", ports)
+		log.Println("listing internal ports, ", ports)
+		for key, port := range ports {
+		//	delete(ports, key)
+			log.Println("internal port: ", key, port)
+		}
+		//log.Println("Removed internal ports, ", ports)
+		log.Println("Loading rancher external ports for  " + container.ID)
+
+		for _, portVal := range b.GetExternalPorts(container.ID, "") {
+			log.Println("externalPort result: ", portVal)
+			port := strings.Split(portVal, ":")[1]
+			log.Println("ExternalPort:  " + port)
+			published := []dockerapi.PortBinding{ {"0.0.0.0", port}, }
+
+			log.Println("Rancher port  ", port, " loaded and published: ", published)
+			var dockerPort dockerapi.Port
+			dockerPort = dockerapi.Port(port)
+			ports[string(port)] = servicePort(container, dockerPort, published, internalIPAddress)
+		}		
+	}
+
+	
 
 	if len(ports) == 0 && !quiet {
 		log.Println("ignored:", container.ID[:12], "no published ports")
@@ -280,16 +405,26 @@ func (b *Bridge) newService(port ServicePort, isgroup bool) *Service {
 	if isgroup && !metadataFromPort["name"] {
 		service.Name += "-" + port.ExposedPort
 	}
+	if b.config.RancherInternalIP == true {
+	    service.ID = hostname + ":" + container.Name[1:] + "-internal" + ":" + port.ExposedPort
+		service.Name += "-" + "internal"	
+	}
+
 	var p int
 
 	if b.config.Internal == true {
 		service.IP = port.ExposedIP
 		p, _ = strconv.Atoi(port.ExposedPort)
+    } else if b.config.RancherInternalIP == true {
+        service.IP = port.ExposedIP
+        p, _ = strconv.Atoi(port.ExposedPort)	
+        log.Println("Setting service internal IP to: ", port.ExposedIP)	
 	} else {
 		service.IP = port.HostIP
 		p, _ = strconv.Atoi(port.HostPort)
 	}
 	service.Port = p
+    log.Println("Setting service IP to: ", service.IP)	
 
 	if b.config.UseIpFromLabel != "" {
 		containerIp := container.Config.Labels[b.config.UseIpFromLabel]
@@ -343,6 +478,8 @@ func (b *Bridge) newService(port ServicePort, isgroup bool) *Service {
 	delete(metadata, "name")
 	service.Attrs = metadata
 	service.TTL = b.config.RefreshTtl
+
+	log.Println("Final Setting service IP to: ", service.IP)	
 
 	return service
 }

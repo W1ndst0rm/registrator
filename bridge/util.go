@@ -3,6 +3,7 @@ package bridge
 import (
 	"strconv"
 	"strings"
+	"log"
 
 	"github.com/cenkalti/backoff"
 	dockerapi "github.com/fsouza/go-dockerclient"
@@ -84,7 +85,9 @@ func serviceMetaData(config *dockerapi.Config, port string) (map[string]string, 
 	return metadata, metadataFromPort
 }
 
-func servicePort(container *dockerapi.Container, port dockerapi.Port, published []dockerapi.PortBinding) ServicePort {
+func servicePort(container *dockerapi.Container, port dockerapi.Port, published []dockerapi.PortBinding, exposedIPVal string) ServicePort {
+	log.Println("servicePort ", port, " published: ", published)
+
 	var hp, hip, ep, ept, eip, nm string
 	if len(published) > 0 {
 		hp = published[0].HostPort
@@ -104,8 +107,10 @@ func servicePort(container *dockerapi.Container, port dockerapi.Port, published 
 
 	exposedPort := strings.Split(string(port), "/")
 	ep = exposedPort[0]
+	log.Println("Exposed Port[0] = ", ep)
 	if len(exposedPort) == 2 {
 		ept = exposedPort[1]
+		log.Println("Exposed Port[1] = ", ept)
 	} else {
 		ept = "tcp" // default
 	}
@@ -117,6 +122,11 @@ func servicePort(container *dockerapi.Container, port dockerapi.Port, published 
 			eip = network.IPAddress
 		}
 	}
+	if exposedIPVal != "" {
+		eip = exposedIPVal
+	}
+
+	log.Println("exposed port " + ep)
 
 	return ServicePort{
 		HostPort:          hp,
