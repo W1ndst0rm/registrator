@@ -467,6 +467,9 @@ func (b *Bridge) newService(port ServicePort, isgroup bool) *Service {
 		service.Tags = combineTags(
 			mapDefault(metadata, "tags", ""), b.config.ForceTags)
 	}
+	if b.config.RancherInternalIP == true {
+		service.Tags = []string{}
+	}
 
 	id := mapDefault(metadata, "id", "")
 	if id != "" {
